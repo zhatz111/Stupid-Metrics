@@ -711,7 +711,7 @@ class AlgoTrading:
         print_("")
 
         # ensure that all data is exported for retention purposes
-        if self.curr_order:
+        if bool(self.curr_order):
             self.export_data()
         else:
             self.export_data(historic_only=True)
@@ -750,8 +750,18 @@ if __name__ == "__main__":
         save_path=fig_save_path,
     )
 
-    algo_trading.mean_reversion_crypto_algo()
-    schedule.every(10).minutes.do(algo_trading.mean_reversion_crypto_algo)
+    print_(f"[bold green]Algo Trading Script started at {datetime.now()}[/]")
+
+    # make sure the job starts at the 10s place so that the
+    # api query timestamps are aligned with when the script runs
+    while True:
+        now = datetime.now()
+        if now.minute % 10 == 0 and now.second == 0:
+            break
+        time.sleep(1)  # Check every second
+
+    # Schedule the job every 10 minutes
+    schedule.every(10).minutes.at(":05").do(algo_trading.mean_reversion_crypto_algo)
 
     while True:
         schedule.run_pending()
