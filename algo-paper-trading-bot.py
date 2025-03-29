@@ -20,12 +20,13 @@ from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 
 # Third Party Import
-import schedule
 import numpy as np
 import pandas as pd
+from scipy.linalg import solve
 from dotenv import load_dotenv
 import matplotlib.pyplot as plt
 from rich import print as print_
+import matplotlib.dates as mdates
 from scipy.signal import savgol_filter
 
 # Alpaca Data Imports
@@ -33,14 +34,72 @@ from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.historical import CryptoHistoricalDataClient
 
-# Alpaca Paper Trading Imports
+# Alpaca Trading Imports
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
+from alpaca.data.requests import CryptoLatestQuoteRequest
+
 
 load_dotenv()
+
+
+def one_sided_savitzky_golay(y, window_length, polyorder, deriv=0):
+    """
+    Applies a one-sided Savitzky-Golay filter to the input array.
+
+    Args:
+        y (np.ndarray): The input array to filter.
+        window_length (int): The size of the filter window (must be odd).
+        polyorder (int): The polyorder of the polynomial to fit.
+        deriv (int, optional): The polyorder of the deriv to compute
+                                     (default is 0 for smoothing).
+
+    Returns:
+        np.ndarray: The filtered array or deriv.
+    """
+    if window_length % 2 != 1 or window_length < 1:
+        raise ValueError("Window size must be a positive odd number")
+    if window_length < polyorder + 1:
+        raise ValueError("Window size is too small for the polynomial polyorder")
+
+    half_window = (window_length - 1) // 2
+
+    # Construct the Vandermonde design matrix
+    x = np.arange(window_length)
+    V = np.stack([x**i for i in range(polyorder + 1)], axis=1)
+
+    # Calculate filter coefficients
+    try:
+        coeffs = solve(V.T @ V, V.T)
+    except np.linalg.LinAlgError:
+        raise ValueError(
+            "Singular matrix: try decreasing polynomial polyorder or window size"
+        )
+
+    # Extract the deriv coefficients
+    if deriv > polyorder:
+        raise ValueError("deriv polyorder is too high for the polynomial polyorder")
+
+    deriv_coeffs = coeffs[deriv]
+
+    # Apply the filter to each point, considering the one-sided window
+    filtered_values = np.zeros_like(y)
+    for i in range(len(y)):
+        start = max(0, i - window_length + 1)
+        end = i + 1
+        window = y[start:end]
+
+        if len(window) < window_length:
+            pad_size = window_length - len(window)
+            padded_window = np.pad(window, (pad_size, 0), "edge")
+            filtered_values[i] = np.dot(deriv_coeffs, padded_window)
+        else:
+            filtered_values[i] = np.dot(deriv_coeffs, window)
+
+    return filtered_values
 
 
 class AlgoTrading:
@@ -54,6 +113,7 @@ class AlgoTrading:
         resolution: int,
         time_length: int,
         first_mov_avg: int,
+        deriv: int,
         second_mov_avg: int,
         deriv_cutoff: float,
         symbol: str,
@@ -73,10 +133,15 @@ class AlgoTrading:
         self.symbol = symbol
         self.win_length = win_length
         self.data_path = data_path
+        self.deriv = deriv
         self.curr_order = {}
         self.has_position = False
         self.save_path = save_path
         self.tmpfile = BytesIO()
+        self.buying_power = 0
+        self.cash = 0
+        self.bid_price = 0
+        self.ask_price = 0
 
     def get_crypto_data(self) -> Tuple[pd.DataFrame, float]:
         """
@@ -88,8 +153,8 @@ class AlgoTrading:
             with crypto bar data and the current price of the asset
         """
         time_frame = TimeFrame(self.resolution, TimeFrameUnit("Min"))
-        start_time = datetime.now() - timedelta(days=self.time_length)
-        end_time = datetime.now()
+        start_time = datetime.now(pytz.utc) - timedelta(days=self.time_length)
+        end_time = datetime.now(pytz.utc)
 
         # No keys required for crypto data
         client = CryptoHistoricalDataClient()
@@ -125,7 +190,7 @@ class AlgoTrading:
             data["Moving Avg (First)"],
             window_length=self.win_length,
             polyorder=2,
-            deriv=2,
+            deriv=self.deriv,
         )
 
         # using the second derivative instead of the first as it better approximates the peaks and dips
@@ -139,18 +204,31 @@ class AlgoTrading:
             data["Moving Avg (Second)"],
             window_length=self.win_length,
             polyorder=2,
-            deriv=2,
+            deriv=self.deriv,
         )
 
         curr_row = data.iloc[-1, :]
 
         return data, curr_row
 
-    def graph_data(self, save_path, time_length=5):
-        graph_data, _ = self.get_crypto_data()
-        graph_data["timestamp"] = pd.to_datetime(graph_data["timestamp"], utc=True)
-        start_time = datetime.now() - timedelta(days=time_length)
-        end_time = datetime.now()
+    def get_account_details(self):
+        trading_client = TradingClient(self.api_key, self.api_secrets, paper=True)
+
+        # Get our account information.
+        account = trading_client.get_account()
+
+        # Check if our account is restricted from trading.
+        if account.trading_blocked:
+            raise ValueError("Account is currently restricted from trading.")
+
+        self.buying_power = float(account.buying_power)
+        self.cash = float(account.cash)
+
+    def graph_data(self, save_path, time_len=5):
+        data_, _ = self.get_crypto_data()
+        start_time = datetime.now(pytz.utc) - timedelta(days=time_len)
+        end_time = datetime.now(pytz.utc)
+        graph_data = data_[data_["timestamp"] > start_time]
 
         save_path.mkdir(parents=True, exist_ok=True)
         order_data = self.import_order_data(all_orders=True)
@@ -180,31 +258,25 @@ class AlgoTrading:
             graph_data["Moving Avg (First)"],
             c="dodgerblue",
             linestyle="--",
-            label=f"Moving Average ({self.first_mov_avg_res / (int(60 / self.resolution) * 24)} days)",
+            label=f"Moving Average ({self.first_mov_avg_res / (int(60 / self.resolution) * 24):0.02f} days)",
         )
-        # ax[0].plot(graph_data["timestamp"], graph_data["Moving Avg (Hour)"]+ 2*graph_data["Moving Avg (Hour) STD"], c="lightcoral", linestyle="--", label=f"STD High ({self.first_mov_avg_res/(int(60/resolution)*24)} days)")
-        # ax[0].plot(graph_data["timestamp"], graph_data["Moving Avg (Hour)"]- 2*graph_data["Moving Avg (Hour) STD"], c="lightcoral", linestyle="--", label=f"STD Low ({self.first_mov_avg_res/(int(60/resolution)*24)} days)")
 
         ax[0].plot(
             graph_data["timestamp"],
             graph_data["Moving Avg (Second)"],
             c="chocolate",
             linestyle="--",
-            label=f"Moving Average ({self.second_mov_avg_res / (int(60 / self.resolution) * 24)} days)",
+            label=f"Moving Average ({self.second_mov_avg_res / (int(60 / self.resolution) * 24):0.02f} days)",
         )
-        # ax[0].plot(graph_data["timestamp"], graph_data["Moving Avg (Day)"]+ 2*graph_data["Moving Avg (Day) STD"], c="palegreen", linestyle="--", label=f"STD High ({self.second_mov_avg_res/(int(60/resolution)*24)} days)")
-        # ax[0].plot(graph_data["timestamp"], graph_data["Moving Avg (Day)"]- 2*graph_data["Moving Avg (Day) STD"], c="palegreen", linestyle="--", label=f"STD Low ({self.second_mov_avg_res/(int(60/resolution)*24)} days)")
 
         ax[0].grid()
         ax[0].legend()
         ax[0].set_xlim(start_time, end_time)
+        # ax[0].set_ylim(min(graph_data["close"])-min(graph_data["close"])*0.2, max(graph_data["close"])+max(graph_data["close"])*0.2)
         ax[0].set_xlabel("Datetime")
         ax[0].set_ylabel(f"{self.symbol}")
-        
 
-        # axis_interval = int(self.time_length / 20) if self.time_length / 20 > 1 else 1
-        # ax[0].xaxis.set_major_locator(mdates.DayLocator(interval=axis_interval))
-        ax[0].tick_params(axis="x", labelrotation=45)
+        ax[0].tick_params(axis="x", labelrotation=60)
 
         ax[1].plot(
             graph_data["timestamp"],
@@ -216,19 +288,22 @@ class AlgoTrading:
 
         ax[1].grid()
         ax[1].set_xlim(start_time, end_time)
+        # ax[1].set_ylim(min(graph_data["Moving Avg (First) Deriv"])*1.2, max(graph_data["Moving Avg (First) Deriv"])*1.2)
         ax[1].set_xlabel("Datetime")
-        ax[1].set_ylabel("Second Derivative")
-        # ax[1].set_title(
-        #     f"Second Derivative of {self.symbol} Moving Average with Resolution: {self.first_mov_avg_Res / (int(60 / self.resolution) * 24)} days"
-        # )
-        # ax[1].xaxis.set_major_locator(mdates.DayLocator(interval=axis_interval))
-        ax[1].tick_params(axis="x", labelrotation=45)
+
+        if self.deriv == 1:
+            ax[1].set_ylabel("First Derivative")
+        elif self.deriv == 2:
+            ax[1].set_ylabel("Second Derivative")
+
+        ax[1].tick_params(axis="x", labelrotation=60)
 
         for _, data in order_dict.items():
-            if datetime.strptime(
-                data["Buy Datetime"], "%Y-%m-%d %H:%M:%S %z"
-            ) > pytz.utc.localize(start_time):
-                if data["Total Profit"] is not None:
+            if (
+                datetime.strptime(data["Buy Datetime"], "%Y-%m-%d %H:%M:%S %z")
+                > start_time
+            ):
+                if not bool(np.isnan(data["Total Profit"])):
                     if data["Total Profit"] >= 0:
                         successful_trades += 1
                         sum_profit += data["Total Profit"]
@@ -352,18 +427,36 @@ class AlgoTrading:
                         linestyle="--",
                         c="green",
                     )
-        title = f"{self.symbol} | {successful_trades} Profitable Trades (Best: ${best_trade:,.2f}), " \
-        f"{failed_trades} Unprofitable Trades (Worst: ${worst_trade:,.2f}) | " \
-        f"Total Profit: ${sum_profit:,.2f} over {time_length} days"
+        title = (
+            f"{self.symbol} | {successful_trades} Profitable Trades (Best: ${best_trade:,.2f}), "
+            f"{failed_trades} Unprofitable Trades (Worst: ${worst_trade:,.2f}) | "
+            f"Total Profit: ${sum_profit:,.2f} over {time_len} days"
+        )
+
+        title_2 = (
+            f"Resolution: {self.resolution}, First Moving Average: {self.first_mov_avg:0.02f}, Second Moving Average: {self.second_mov_avg:0.02f}, "
+            f"Derivative Cutoff: {self.deriv_cutoff:0.02f}, Savgol Window Length: {self.win_length}, Derivative: {self.deriv}"
+        )
 
         ax[0].set_title(title)
+        ax[1].set_title(title_2)
+
+        # Set x-axis to display hour ticks
+        hours = mdates.HourLocator(interval=4)  # Ticks every hour
+        h_fmt = mdates.DateFormatter("%Y-%m-%d %H:%M")  # Format as HH:MM
+
+        ax[0].xaxis.set_major_locator(hours)
+        ax[0].xaxis.set_major_formatter(h_fmt)
+
+        ax[1].xaxis.set_major_locator(hours)
+        ax[1].xaxis.set_major_formatter(h_fmt)
 
         fig.tight_layout()
 
         fig.savefig(
             Path(
                 save_path,
-                f"{self.symbol.replace('/', '')}_{datetime.now().strftime('%Y-%m-%d_%H%M')}.png",
+                f"{self.symbol.replace('/', '')}_{datetime.now().strftime('%Y-%m-%d_%H%M')}_EST.png",
             ),
             format="png",
         )
@@ -388,12 +481,12 @@ class AlgoTrading:
             self.tmpfile.seek(0)
             image_attachment = MIMEImage(
                 self.tmpfile.read(),
-                name=f"{self.symbol.replace('/', '')}_{datetime.now().strftime('%Y-%m-%d_%H%M')}.png",
+                name=f"{self.symbol.replace('/', '')}_{datetime.now().strftime('%Y-%m-%d_%H%M')}_EST.png",
             )
             msg.attach(image_attachment)
 
         # Email details
-        subject = f"Trade Execution {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        subject = f"Trade Execution {datetime.now().strftime('%Y-%m-%d %H:%M')} EST"
 
         if buy:
             html_content = f"""\
@@ -402,13 +495,17 @@ class AlgoTrading:
                     <h3>Buy Executed:</h3>
                     <h3><span style="color:orange;">{self.curr_order["Buy Datetime"]}</span></h3>
                     <h3>Quantity: <span style="color:orange;">{self.curr_order["Buy Quantity"]:0.04f}</span></h3>
+                    <h3>Current Buying Power: <span style="color:green;">{self.buying_power:,.02f}</span></h3>
+                    <h3>Current Cash: <span style="color:green;">{self.cash:,.02f}</span></h3>
                     <p>------------------------------------------</p>
                     <p>Symbol: <span style="color:dodgerblue;">{self.curr_order["Symbol"]}</span></p>
                     <p>Buy Order ID: <span style="color:magenta;">{self.curr_order["Buy Order ID"]}</span></p>
                     <p>Buy Datetime: <span style="color:dodgerblue;">{self.curr_order["Buy Datetime"]}</span></p>
                     <p>Buy Price: <span style="color:dodgerblue;">${self.curr_order["Buy Price"]:,.02f}</span></p>
                     <p>Buy Quantity: <span style="color:dodgerblue;">{self.curr_order["Buy Quantity"]:0.04f}</span></p>
-                    <p>Second Deriv at Purchase: <span style="color:dodgerblue;">{self.curr_order["Deriv at Purchase"]:0.04f}</span></p>
+                    <p>Derivative ({self.deriv}) at Purchase: <span style="color:dodgerblue;">{self.curr_order["Deriv at Purchase"]:0.04f}</span></p>
+                    <p><span style="font-weight:bold;">Current Bid Price:</span> <span style="color:green;font-weight:bold;">${self.bid_price:,.02f}</span></p>
+                    <p><span style="font-weight:bold;">Current Ask Price:</span> <span style="color:green;font-weight:bold;">${self.ask_price:,.02f}</span></p>
                 </body>
             </html>
             """
@@ -424,21 +521,24 @@ class AlgoTrading:
                     <h3><span style="color:{profit_color};">{self.curr_order["Sell Datetime"]}</span></h3>
                     <h3>Quantity: <span style="color:{profit_color};">{self.curr_order["Quantity Sold"]:0.04f}</span>,
                     Profit: <span style="color:{profit_color};">${self.curr_order["Total Profit"]:,.02f}</span></h3>
+                    <h3>Current Buying Power: <span style="color:green;">{self.buying_power:,.02f}</span></h3>
+                    <h3>Current Cash: <span style="color:green;">{self.cash:,.02f}</span></h3>
                     <p>------------------------------------------</p>
                     <p>Symbol: <span style="color:dodgerblue;">{self.curr_order["Symbol"]}</span></p>
                     <p>Buy Order ID: <span style="color:magenta;">{self.curr_order["Buy Order ID"]}</span></p>
                     <p>Buy Datetime: <span style="color:dodgerblue;">{self.curr_order["Buy Datetime"]}</span></p>
                     <p>Buy Price: <span style="color:{profit_color};">${self.curr_order["Buy Price"]:,.02f}</span></p>
                     <p>Buy Quantity: <span style="color:dodgerblue;">{self.curr_order["Buy Quantity"]:0.04f}</span></p>
-                    <p>Second Deriv at Purchase: <span style="color:dodgerblue;">{self.curr_order["Deriv at Purchase"]:0.04f}</span></p>
+                    <p>Derivative ({self.deriv}) at Purchase: <span style="color:dodgerblue;">{self.curr_order["Deriv at Purchase"]:0.04f}</span></p>
                     <p>Sell Order ID: <span style="color:magenta;">{self.curr_order["Sell Order ID"]}</span></p>
                     <p>Sell Datetime: <span style="color:dodgerblue;">{self.curr_order["Sell Datetime"]}</span></p>
                     <p>Sell Price: <span style="color:{profit_color};">${self.curr_order["Sell Price"]:,.02f}</span></p>
                     <p>Quantity Sold: <span style="color:dodgerblue;">{self.curr_order["Quantity Sold"]:0.04f}</span></p>
                     <p>Percent Change: <span style="color:dodgerblue;">{self.curr_order["Percent Change"]:0.04f}</span></p>
                     <p>Total Profit: <span style="color:{profit_color};">{self.curr_order["Total Profit"]:,.02f}</span></p>
-                    <p>Second Deriv at Sell: <span style="color:dodgerblue;">{self.curr_order["Deriv at Sell"]:0.04f}</span></p>
-
+                    <p>Derivative ({self.deriv}) at Sell: <span style="color:dodgerblue;">{self.curr_order["Deriv at Sell"]:0.04f}</span></p>
+                    <p><span style="font-weight:bold;">Current Bid Price:</span> <span style="color:green;font-weight:bold;">${self.bid_price:,.02f}</span></p>
+                    <p><span style="font-weight:bold;">Current Ask Price:</span> <span style="color:green;font-weight:bold;">${self.ask_price:,.02f}</span></p>
                 </body>
             </html>
             """
@@ -458,7 +558,7 @@ class AlgoTrading:
         except Exception as e:
             print(f"Error: {e}")
 
-    def execute_trade(self, quantity: float):
+    def execute_trade(self, cash_amount: float):
         """_summary_
 
         Args:
@@ -467,13 +567,12 @@ class AlgoTrading:
         Returns:
             _type_: returns the submitted order to alpaca
         """
-
         trading_client = TradingClient(self.api_key, self.api_secrets, paper=True)
 
         # preparing market order
         market_order_request = MarketOrderRequest(
             symbol=self.symbol,
-            qty=quantity,
+            notional=cash_amount,
             side=OrderSide.BUY,
             type="market",
             time_in_force=TimeInForce.GTC,
@@ -539,6 +638,16 @@ class AlgoTrading:
             "Deriv at Sell": "",
         }
 
+    def reset_fig_data(self):
+        self.tmpfile = BytesIO()
+
+    def get_latest_quote(self):
+        client = CryptoHistoricalDataClient()
+        quote_request = CryptoLatestQuoteRequest(symbol_or_symbols=[self.symbol])
+        latest_quote = client.get_crypto_latest_quote(quote_request)
+
+        return latest_quote[self.symbol].bid_price, latest_quote[self.symbol].ask_price
+
     def import_order_data(self, all_orders=False):
         order_file_path = Path(
             self.data_path, f"{self.symbol.replace('/', '')}_order_data.csv"
@@ -560,6 +669,19 @@ class AlgoTrading:
                 self.curr_order = df_order.iloc[-1, :].to_dict()
             if all_orders:
                 return df_order
+        elif check_last_order and (check_last_order[0].side == "buy"):
+            _, curr_row = self.get_crypto_data()
+            self.reset_order()
+            self.curr_order["Symbol"] = check_last_order[0].symbol
+            self.curr_order["Buy Order ID"] = check_last_order[0].client_order_id
+            self.curr_order["Buy Datetime"] = check_last_order[0].filled_at.strftime(
+                "%Y-%m-%d %H:%M:%S %z"
+            )
+            self.curr_order["Buy Price"] = float(check_last_order[0].filled_avg_price)
+            self.curr_order["Buy Quantity"] = float(check_last_order[0].filled_qty)
+            self.curr_order["Deriv at Purchase"] = float(
+                curr_row["Moving Avg (First) Deriv"]
+            )
         else:
             self.reset_order()
         return []
@@ -567,6 +689,9 @@ class AlgoTrading:
     def export_data(self, historic_only=False):
         # Fetch historic data
         data, curr_row = self.get_crypto_data()
+
+        if not bool(self.curr_order):
+            self.reset_order()
 
         # Define file paths
         historic_file_path = Path(
@@ -577,35 +702,43 @@ class AlgoTrading:
         )
 
         if historic_file_path.is_file():
+            df_historic = pd.read_csv(historic_file_path)
             curr_row_df = curr_row.to_frame().T  # Transpose to make it a row
-            data = pd.concat([data, curr_row_df], ignore_index=True)
+            time_str = df_historic.iloc[-1, :]["timestamp"]
+            time_str_fixed = (
+                time_str[:-3] + time_str[-2:]
+            )  # Convert '+00:00' to '+0000'
+            dt = datetime.strptime(time_str_fixed, "%Y-%m-%d %H:%M:%S%z")
+            if curr_row["timestamp"].to_pydatetime() != dt:
+                data = pd.concat([df_historic, curr_row_df], ignore_index=True)
+        data.to_csv(historic_file_path, index=False)  # Ensure historic data is saved
 
         if historic_only:
-            data.to_csv(historic_file_path, index=False)
-            return
-        
-        data.to_csv(historic_file_path, index=False)
+            return  # Avoid redundant writes
 
-        df_order = pd.DataFrame([self.curr_order])
-        # Load existing order if file exists
+        # Avoid writing empty orders
+        if not all(value == "" for value in self.curr_order.values()):
+            df_order = pd.DataFrame([self.curr_order])
+        else:
+            df_order = pd.DataFrame()  # Empty dataframe to prevent issues
+
+        # Load existing order data
         if order_file_path.is_file():
             df_existing = pd.read_csv(order_file_path)
 
-            # Ensure buy_order_id exists in both curr_order and existing data
             buy_order_id = self.curr_order.get("Buy Order ID")
-            if buy_order_id in df_existing["Buy Order ID"].values:
-                df_existing.loc[df_existing["Buy Order ID"] == buy_order_id] = [
-                    pd.Series(self.curr_order)
-                ]
-            else:
-                # Append the new order if the buy_order_id doesn't exist
+            if buy_order_id and buy_order_id in df_existing["Buy Order ID"].values:
+                df_existing.loc[
+                    df_existing["Buy Order ID"] == buy_order_id, df_order.columns
+                ] = df_order.values
+            elif not df_order.empty:
                 df_existing = pd.concat([df_existing, df_order], ignore_index=True)
         else:
-            # If no existing file, create a new one with the order data
-            df_existing = df_order
+            df_existing = df_order  # Only store new order if file doesn't exist
 
-        # Save the updated order data back to the file
-        df_existing.to_csv(order_file_path, index=False)
+        # Save updated order data
+        if not df_existing.empty:
+            df_existing.to_csv(order_file_path, index=False)
 
     def mean_reversion_crypto_algo(self):
         """_summary_"""
@@ -617,8 +750,11 @@ class AlgoTrading:
         # position or not
 
         _ = self.import_order_data()
+        self.get_account_details()
+        self.bid_price, self.ask_price = self.get_latest_quote()
+
         print_("-------------------------------------------------")
-        print_(f"[bold blue]Execution Time: {datetime.now()}[/]")
+        print_(f"[bold blue]Execution Time: {datetime.now()} EST[/]")
 
         if (
             (curr_row["Moving Avg (First)"] > curr_row["Moving Avg (Second)"])
@@ -629,10 +765,11 @@ class AlgoTrading:
             self.reset_order()
 
             # add logic to execute order then fill in order details after it is accepted
-            qty = self.investment / curr_row["close"]
+            # qty = (self.cash/2) / curr_row["close"]
 
             # Execute the trades based on the condition
-            _ = self.execute_trade(quantity=qty)
+            # Only use 95% of the available cash in the account to trade with
+            _ = self.execute_trade(cash_amount=self.cash*0.95)
             time.sleep(2)
             last_order_algo = self.get_last_order_data()
 
@@ -649,13 +786,15 @@ class AlgoTrading:
             print_(
                 f"New Order Bought at [bold green]{self.curr_order['Buy Datetime']}[/], Quantity: [bold green]{self.curr_order['Buy Quantity']:0.04f}[/]"
             )
-
+            self.get_account_details()
+            self.export_data()
             self.send_email_update(buy=True)
+            self.reset_fig_data()
 
         if self.has_position:
             if (
                 curr_row["Moving Avg (First) Deriv"]
-                < -self.curr_order["Deriv at Purchase"] * self.deriv_cutoff
+                < self.curr_order["Deriv at Purchase"] * self.deriv_cutoff
             ):
                 # Sell the current position
                 _ = self.sell_position()
@@ -676,9 +815,7 @@ class AlgoTrading:
                 self.curr_order["Total Profit"] = (
                     self.curr_order["Percent Change"] * self.investment / 100
                 )
-                self.curr_order["Deriv at Sell"] = curr_row[
-                    "Moving Avg (First) Deriv"
-                ]
+                self.curr_order["Deriv at Sell"] = curr_row["Moving Avg (First) Deriv"]
 
                 self.investment += self.curr_order["Total Profit"]
 
@@ -691,30 +828,38 @@ class AlgoTrading:
                         f"Current Order Sold at [bold red]{self.curr_order['Sell Datetime']}[/], Quantity: [bold red]{self.curr_order['Quantity Sold']:0.04f}[/], Profit: [bold red]${self.curr_order['Total Profit']:,.02f}[/]"
                     )
                 self.has_position = False
+                self.get_account_details()
+                self.export_data()
                 self.send_email_update(buy=False)
+                self.reset_fig_data()
 
+        print_(f"Current Buying Power: [bold green]${self.buying_power:,.02f}[/]")
+        print_(f"Current Cash: [bold green]${self.cash:,.02f}[/]")
         print_("-------------------------------------------------")
         for key, value in self.curr_order.items():
             if isinstance(value, float):
                 print_(f"{key}: {value:,.04f}")
             else:
                 print_(f"{key}: {value}")
-        print_(f"Close Price: ${curr_row['close']:,.02f}")
+        print_("-------------------------------------------------")
+        print_(f"Close Price: [bold green]${curr_row['close']:,.02f}[/]")
         print_(
-            f"Moving Avg. {self.first_mov_avg_res / (int(60 / self.resolution) * 24)} day: ${curr_row['Moving Avg (First)']:,.02f}"
+            f"Moving Avg. {self.first_mov_avg_res / (int(60 / self.resolution) * 24):0.02f} day: [bold green]${curr_row['Moving Avg (First)']:,.02f}[/]"
         )
         print_(
-            f"Moving Avg. {self.second_mov_avg_res / (int(60 / self.resolution) * 24)} day: ${curr_row['Moving Avg (Second)']:,.02f}"
+            f"Moving Avg. {self.second_mov_avg_res / (int(60 / self.resolution) * 24):0.02f} day: [bold green]${curr_row['Moving Avg (Second)']:,.02f}[/]"
         )
         print_(f"Moving Avg. Deriv: {curr_row['Moving Avg (First) Deriv']:0.04f}")
+        print_(
+            f"[bold]Current Bid Price:[/bold] [bold green]${self.bid_price:,.02f}[/]"
+        )
+        print_(
+            f"[bold]Current Ask Price:[/bold] [bold green]${self.ask_price:,.02f}[/]"
+        )
         print_("-------------------------------------------------")
         print_("")
 
-        # ensure that all data is exported for retention purposes
-        if bool(self.curr_order):
-            self.export_data()
-        else:
-            self.export_data(historic_only=True)
+        self.export_data(historic_only=True)
 
 
 if __name__ == "__main__":
@@ -723,17 +868,21 @@ if __name__ == "__main__":
     API_KEY = os.getenv("APCA-API-KEY-ID")
     API_SECRET = os.getenv("APCA-API-SECRET-KEY")
     INVESTMENT = 10_000  # dollars
-    RESOLUTION = 10  # minute
+    RESOLUTION = 40  # minute
     TIME_LENGTH = 30  # days
-    FIRST_MOV_AVG_DAY = 0.5  # days
-    SECOND_MOV_AVG_DAY = 3  # days
-    DERIV_CUTOFF = 0.15
-    WIN_LENGTH = 3
+    FIRST_MOV_AVG_DAY = 0.3  # days
+    SECOND_MOV_AVG_DAY = 9  # days
+    DERIV_CUTOFF = 1.0
+    WIN_LENGTH = 11
+    DERIVATIVE = 1
     TICKER_SYMBOL = "BTC/USD"
-    DATA_FOLDER = "paper-mean_reversion"
+    DATA_FOLDER = "live-paper-v3"
 
     data_path_ = Path(Path.cwd(), "data/mean_reversion_algo/paper_trading", DATA_FOLDER)
+    data_path_.mkdir(parents=True, exist_ok=True)
+
     fig_save_path = Path(data_path_, "figures")
+    fig_save_path.mkdir(parents=True, exist_ok=True)
 
     algo_trading = AlgoTrading(
         api_key=API_KEY,
@@ -748,21 +897,16 @@ if __name__ == "__main__":
         win_length=WIN_LENGTH,
         data_path=data_path_,
         save_path=fig_save_path,
+        deriv=DERIVATIVE,
     )
 
-    print_(f"[bold green]Algo Trading Script started at {datetime.now()}[/]")
+    print_(f"[bold green]Algo Trading Script started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EST[/] for Account: [bold cyan]{DATA_FOLDER}[/]")
+    algo_trading.mean_reversion_crypto_algo()
 
     # make sure the job starts at the 10s place so that the
     # api query timestamps are aligned with when the script runs
     while True:
         now = datetime.now()
-        if now.minute % 10 == 0 and now.second == 0:
-            break
+        if now.minute % 10 == 0 and now.second == 5:
+            algo_trading.mean_reversion_crypto_algo()
         time.sleep(1)  # Check every second
-
-    # Schedule the job every 10 minutes
-    schedule.every(10).minutes.at(":05").do(algo_trading.mean_reversion_crypto_algo)
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
