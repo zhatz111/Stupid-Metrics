@@ -636,6 +636,8 @@ class AlgoTrading:
             "Percent Change": "",
             "Total Profit": "",
             "Deriv at Sell": "",
+            "Close Price at Sell": "",
+            "Slippage": "",
         }
 
     def reset_fig_data(self):
@@ -769,7 +771,7 @@ class AlgoTrading:
 
             # Execute the trades based on the condition
             # Only use 95% of the available cash in the account to trade with
-            _ = self.execute_trade(cash_amount=self.cash*0.95)
+            _ = self.execute_trade(cash_amount=round(self.cash * 0.95, 2))
             time.sleep(2)
             last_order_algo = self.get_last_order_data()
 
@@ -807,6 +809,12 @@ class AlgoTrading:
                 )
                 self.curr_order["Sell Price"] = float(position_sold[0].filled_avg_price)
                 self.curr_order["Quantity Sold"] = float(position_sold[0].filled_qty)
+                self.curr_order["Close Price at Sell"] = curr_row["close"]
+                self.curr_order["Slippage"] = (
+                    100
+                    * (self.curr_order["Close Price at Sell"] - self.curr_order["Sell Price"])
+                    / self.curr_order["Close Price at Sell"]
+                )
                 self.curr_order["Percent Change"] = (
                     100
                     * (self.curr_order["Sell Price"] - self.curr_order["Buy Price"])
@@ -868,15 +876,18 @@ if __name__ == "__main__":
     API_KEY = os.getenv("APCA-API-KEY-ID")
     API_SECRET = os.getenv("APCA-API-SECRET-KEY")
     INVESTMENT = 10_000  # dollars
-    RESOLUTION = 40  # minute
+    RESOLUTION = 50  # minute
     TIME_LENGTH = 30  # days
-    FIRST_MOV_AVG_DAY = 0.3  # days
-    SECOND_MOV_AVG_DAY = 9  # days
-    DERIV_CUTOFF = 1.0
-    WIN_LENGTH = 11
+    FIRST_MOV_AVG_DAY = 0.5  # days
+    SECOND_MOV_AVG_DAY = 7  # days
+    DERIV_CUTOFF = 0.8
+    WIN_LENGTH = 9
     DERIVATIVE = 1
     TICKER_SYMBOL = "BTC/USD"
     DATA_FOLDER = "live-paper-v3"
+
+    # Set timezone to Eastern Time
+    eastern = pytz.timezone('America/New_York')
 
     data_path_ = Path(Path.cwd(), "data/mean_reversion_algo/paper_trading", DATA_FOLDER)
     data_path_.mkdir(parents=True, exist_ok=True)
@@ -900,13 +911,20 @@ if __name__ == "__main__":
         deriv=DERIVATIVE,
     )
 
-    print_(f"[bold green]Algo Trading Script started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EST[/] for Account: [bold cyan]{DATA_FOLDER}[/]")
+    print_(
+        f"[bold green]Algo Trading Script started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EST[/] for Account: [bold cyan]{DATA_FOLDER}[/]"
+    )
     algo_trading.mean_reversion_crypto_algo()
 
     # make sure the job starts at the 10s place so that the
     # api query timestamps are aligned with when the script runs
     while True:
-        now = datetime.now()
+        now = datetime.now(eastern)  # Get current time in EST
+    
+        # Define trading window: 9:30 AM to 4:00 PM EST
+        start_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        end_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+
         if now.minute % 10 == 0 and now.second == 5:
             algo_trading.mean_reversion_crypto_algo()
         time.sleep(1)  # Check every second
