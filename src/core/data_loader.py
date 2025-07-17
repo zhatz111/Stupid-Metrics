@@ -28,6 +28,7 @@ class DataLoader:
         time_length: int,
         time_frame_unit: str = "Day",
         asset_class: str = "stock",
+        market_reference: str = "SPY",
     ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -41,6 +42,8 @@ class DataLoader:
         self.start_time = datetime.now(pytz.utc) - timedelta(days=self.time_length)
         self.end_time = datetime.now(pytz.utc) - timedelta(days=1)
 
+        self.market_reference = self.load_data(symbols=[market_reference])
+
     def load_data(self, symbols: List[str]):
         
         if self.asset_class == "stock":
@@ -50,6 +53,7 @@ class DataLoader:
                 timeframe=self.time_frame,
                 start=self.start_time,
                 end=self.end_time,
+                adjustment="all",
             )
 
             client = StockHistoricalDataClient(

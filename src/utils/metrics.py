@@ -7,7 +7,7 @@ Created by Zach Hatzenbeller 2025-07-02
 import numpy as np
 
 
-def sharpe_ratio(portfolio_return: float, risk_free_rate: float, std_portfolio: float):
+def sharpe_ratio(portfolio_returns: np.ndarray, annual_rf_rate: float):
     """_summary_
 
     Args:
@@ -18,11 +18,17 @@ def sharpe_ratio(portfolio_return: float, risk_free_rate: float, std_portfolio: 
     Returns:
         _type_: _description_
     """
-    return (portfolio_return - risk_free_rate) / std_portfolio
+    risk_free_rate_daily = annual_rf_rate / 252
+    sharpe_ratio = (
+        (np.mean(portfolio_returns) - risk_free_rate_daily)
+        / (np.std(portfolio_returns) + 1e-9)
+        * np.sqrt(252)
+    )
+    return sharpe_ratio
 
 
 def sortino_ratio(
-    portfolio_return: float, risk_free_rate: float, neg_std_portfolio: float
+    downside_portfolio_returns: np.ndarray, annual_rf_rate: float
 ):
     """_summary_
 
@@ -34,10 +40,16 @@ def sortino_ratio(
     Returns:
         _type_: _description_
     """
-    return (portfolio_return - risk_free_rate) / neg_std_portfolio
+    risk_free_rate_daily = annual_rf_rate / 252
+    sortino_ratio = (
+        (np.mean(downside_portfolio_returns) - risk_free_rate_daily)
+        / (np.std(downside_portfolio_returns) + 1e-9)
+        * np.sqrt(252)
+    )
+    return sortino_ratio
 
 
-def beta(returns_dict: dict, weights_dict: dict, market_reference_returns: list):
+def beta(returns_dict: dict, market_reference_returns: list, weights_dict: dict = None):
     """_summary_
 
     Args:
@@ -50,41 +62,51 @@ def beta(returns_dict: dict, weights_dict: dict, market_reference_returns: list)
     """
     betas = {}
     for key, returns in returns_dict.items():
-        cov_mat = np.cov(np.array(returns, market_reference_returns))
+        reference = market_reference_returns[(len(market_reference_returns)-len(returns)):]
+        cov_mat = np.cov(returns, reference)
         cov_ = cov_mat[0, 1]
-        var_ = np.nanstd(np.array(market_reference_returns)) ** 2
+        var_ = np.nanstd(np.array(reference)) ** 2
         betas[key] = cov_ / var_
 
     portfolio_beta = 0
     for key, beta in betas.items():
-        portfolio_beta += beta * weights_dict[key]
+        if weights_dict is not None:
+            portfolio_beta += beta * weights_dict[key]
+        else:
+            # weights are assumed to be equal across assets
+            portfolio_beta += beta * (1/len(returns_dict.keys()))
 
     return portfolio_beta, betas
 
 
 def alpha(
-    portfolio_return: float,
-    risk_free_rate: float,
-    expected_market_return: float,
+    portfolio_returns: np.ndarray,
+    market_reference_returns: np.ndarray,
+    annual_rf_rate: float,
     portfolio_beta: float,
 ):
     """_summary_
 
     Args:
         portfolio_return (float): _description_
-        risk_free_rate (float): _description_
+        annual_rf_rate (float): _description_
         expected_market_return (float): _description_
         portfolio_beta (float): _description_
 
     Returns:
         _type_: _description_
     """
-    return portfolio_return - (
-        risk_free_rate + portfolio_beta * (expected_market_return - risk_free_rate)
-    )
+    reference = market_reference_returns[(len(market_reference_returns)-len(portfolio_returns)):]
+    rf_daily = annual_rf_rate / 252  # Approximate daily Rf
+    excess_market = reference - rf_daily
+    expected_portfolio = rf_daily + portfolio_beta * excess_market
+    alpha_series = portfolio_returns - expected_portfolio
+    daily_alpha = np.mean(alpha_series)
+    annualized_alpha = daily_alpha * 252
+    return annualized_alpha
 
 
-def max_drawdown(equity_curve: list):
+def max_drawdown(equity: np.ndarray):
     """_summary_
 
     Args:
@@ -93,24 +115,15 @@ def max_drawdown(equity_curve: list):
     Returns:
         _type_: _description_
     """
-    peak = equity_curve[0]
-    max_dd = 0
-    for value in equity_curve:
-        if value > peak:
-            peak = value
-        drawdown = (peak - value) / peak
-        max_dd = max(max_dd, drawdown)
-    return max_dd
+    previous_peaks = np.maximum.accumulate(equity)
+    drawdown = abs(equity - previous_peaks) / previous_peaks
+    max_drawdown = np.max(drawdown)
+    return max_drawdown, drawdown
 
+def win_loss_rates(pnl: np.ndarray):
 
-def profit_factor(gross_profits: float, gross_losses: float):
-    """_summary_
+    win_rate = np.mean(pnl > 0)
+    avg_win = np.mean(pnl[pnl > 0])
+    avg_loss = np.mean(pnl[pnl < 0])
 
-    Args:
-        gross_profits (float): _description_
-        gross_losses (float): _description_
-
-    Returns:
-        _type_: _description_
-    """
-    return gross_profits/gross_losses
+    return win_rate, avg_win, avg_loss

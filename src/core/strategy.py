@@ -30,14 +30,12 @@ class Strategy(ABC):
         """
         pass
 
-    def compute_indicators(self) -> pd.DataFrame:
-        df = self.data.copy()
+    def helper_compute_indicators(self, group_df) -> pd.DataFrame:
         for ind in self.indicators:
             ind["column_name"] = []  # initialize here
-
             name = ind["name"]
             params = ind.get("params", {})
-            func = getattr(df.ta, name)
+            func = getattr(group_df.ta, name)
 
             result = func(**params, append=True)
 
@@ -46,18 +44,21 @@ class Strategy(ABC):
                 ind["column_name"].append(result.name)
             elif isinstance(result, pd.DataFrame):
                 ind["column_name"].extend(result.columns)
-
-        return df
+        return group_df
+    
+    def compute_indicators(self):
+        df = self.data.copy()
+        return df.groupby("symbol").apply(self.helper_compute_indicators).reset_index(drop=True)
 
     @abstractmethod
     def generate_signals(self):
         """Generate buy/sell signals"""
         pass
 
-    @abstractmethod
-    def backtest(self):
-        """Backtest the strategy logic"""
-        pass
+    # @abstractmethod
+    # def backtest(self):
+    #     """Backtest the strategy logic"""
+    #     pass
 
 
 class MARSdx(Strategy):
@@ -101,5 +102,5 @@ class MARSdx(Strategy):
         else:
             return None
 
-    def backtest(self):
-        return super().backtest()
+    # def backtest(self):
+    #     return super().backtest()
